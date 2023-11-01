@@ -1,0 +1,196 @@
+From c7abb35eaee2d418b6fa1d7e856d825a07fa1d7d Mon Sep 17 00:00:00 2001
+From: Artem Savkov <asavkov@redhat.com>
+Date: Tue, 11 May 2021 09:32:44 +0200
+Subject: [RHEL8.4 KPATCH] KVM: VMX: Don't use vcpu->run->internal.ndata as an
+ array index
+
+Kernels:
+4.18.0-305.el8
+
+Changes since last build:
+arches: x86_64
+vmx.o: changed function: vmx_handle_exit
+---------------------------
+
+Modifications: Jump label workarounds in vmcs_read(write)* functions.
+Unfortunately changing these in vmx_flush_pml_buffer() results in
+compiler changing its optimization decisions and affecting 3 unrelated
+functions. I couldn't figure out a way to avoid this so those are added
+to KPATCH_IGNORE_FUNCTION.
+Specific compiler decisions leading to these changes:
+ - evmcs_read16 inlined into vmx_read_guest_seg_selector
+ - evmcs_touch_msr_bitmap inlined into pt_update_intercept_for_msr
+ - evmcs_write16 inlined into vmx_vcpu_reset
+ - evmcs_write64 inlined into vmx_vcpu_reset
+
+commit b43ff8b994b47e64db6afe4ed8dbe638c49fd2cf
+Author: Jon Maloy <jmaloy@redhat.com>
+Date:   Mon May 3 20:15:43 2021 -0400
+
+    KVM: VMX: Don't use vcpu->run->internal.ndata as an array index
+
+    Bugzilla: https://bugzilla.redhat.com/1954221
+    Upstream Status: Merged
+    Build Info: https://brewweb.engineering.redhat.com/brew/taskinfo?taskID=36611892
+    CVE: CVE-2021-3501
+
+    commit 04c4f2ee3f68c9a4bf1653d15f1a9a435ae33f7a
+    Author: Reiji Watanabe <reijiw@google.com>
+    Date:   Tue Apr 13 15:47:40 2021 +0000
+
+        KVM: VMX: Don't use vcpu->run->internal.ndata as an array index
+
+        __vmx_handle_exit() uses vcpu->run->internal.ndata as an index for
+        an array access.  Since vcpu->run is (can be) mapped to a user address
+        space with a writer permission, the 'ndata' could be updated by the
+        user process at anytime (the user process can set it to outside the
+        bounds of the array).
+        So, it is not safe that __vmx_handle_exit() uses the 'ndata' that way.
+
+        Fixes: 1aa561b1a4c0 ("kvm: x86: Add "last CPU" to some KVM_EXIT information")
+        Signed-off-by: Reiji Watanabe <reijiw@google.com>
+        Reviewed-by: Jim Mattson <jmattson@google.com>
+        Message-Id: <20210413154739.490299-1-reijiw@google.com>
+        Cc: stable@vger.kernel.org
+        Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+
+    Signed-off-by: Jon Maloy <jmaloy@redhat.com>
+
+Signed-off-by: Artem Savkov <asavkov@redhat.com>
+Acked-by: Joe Lawrence <joe.lawrence@redhat.com>
+---
+ arch/x86/kvm/vmx/vmx.c | 56 +++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 47 insertions(+), 9 deletions(-)
+
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index f6b70e177eef3..8dbf613e86cb8 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -62,6 +62,8 @@
+ #include "vmx.h"
+ #include "x86.h"
+ 
++#include "kpatch-macros.h"
++
+ MODULE_AUTHOR("Qumranet");
+ MODULE_LICENSE("GPL");
+ 
+@@ -778,6 +780,7 @@ static u16 vmx_read_guest_seg_selector(struct vcpu_vmx *vmx, unsigned seg)
+ 		*p = vmcs_read16(kvm_vmx_segment_fields[seg].selector);
+ 	return *p;
+ }
++KPATCH_IGNORE_FUNCTION(vmx_read_guest_seg_selector);
+ 
+ static ulong vmx_read_guest_seg_base(struct vcpu_vmx *vmx, unsigned seg)
+ {
+@@ -3866,6 +3869,7 @@ void pt_update_intercept_for_msr(struct kvm_vcpu *vcpu)
+ 		vmx_set_intercept_for_msr(vcpu, MSR_IA32_RTIT_ADDR0_B + i * 2, MSR_TYPE_RW, flag);
+ 	}
+ }
++KPATCH_IGNORE_FUNCTION(pt_update_intercept_for_msr);
+ 
+ static bool vmx_guest_apic_has_interrupt(struct kvm_vcpu *vcpu)
+ {
+@@ -4473,6 +4477,7 @@ static void vmx_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+ 	if (init_event)
+ 		vmx_clear_hlt(vcpu);
+ }
++KPATCH_IGNORE_FUNCTION(vmx_vcpu_reset);
+ 
+ static void enable_irq_window(struct kvm_vcpu *vcpu)
+ {
+@@ -5710,13 +5715,46 @@ static void vmx_destroy_pml_buffer(struct vcpu_vmx *vmx)
+ 	}
+ }
+ 
++static __always_inline void kpatch_vmcs_write16(unsigned long field, u16 value)
++{
++	vmcs_check16(field);
++	if (unlikely(static_key_enabled(&enable_evmcs)))
++		return evmcs_write16(field, value);
++
++	__vmcs_writel(field, value);
++}
++
++static __always_inline u16 kpatch_vmcs_read16(unsigned long field)
++{
++	vmcs_check16(field);
++	if (unlikely(static_key_enabled(&enable_evmcs)))
++		return evmcs_read16(field);
++	return __vmcs_readl(field);
++}
++
++static __always_inline u32 kpatch_vmcs_read32(unsigned long field)
++{
++	vmcs_check32(field);
++	if (unlikely(static_key_enabled(&enable_evmcs)))
++		return evmcs_read32(field);
++	return __vmcs_readl(field);
++}
++
++static __always_inline u64 kpatch_vmcs_read64(unsigned long field)
++{
++	vmcs_check64(field);
++	if (unlikely(static_key_enabled(&enable_evmcs)))
++		return evmcs_read64(field);
++	return __vmcs_readl(field);
++}
++
+ static void vmx_flush_pml_buffer(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+ 	u64 *pml_buf;
+ 	u16 pml_idx;
+ 
+-	pml_idx = vmcs_read16(GUEST_PML_INDEX);
++	pml_idx = kpatch_vmcs_read16(GUEST_PML_INDEX);
+ 
+ 	/* Do nothing if PML buffer is empty */
+ 	if (pml_idx == (PML_ENTITY_NUM - 1))
+@@ -5738,7 +5776,7 @@ static void vmx_flush_pml_buffer(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	/* reset PML index */
+-	vmcs_write16(GUEST_PML_INDEX, PML_ENTITY_NUM - 1);
++	kpatch_vmcs_write16(GUEST_PML_INDEX, PML_ENTITY_NUM - 1);
+ }
+ 
+ /*
+@@ -5988,7 +6026,7 @@ static int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+ 		dump_vmcs();
+ 		vcpu->run->exit_reason = KVM_EXIT_FAIL_ENTRY;
+ 		vcpu->run->fail_entry.hardware_entry_failure_reason
+-			= vmcs_read32(VM_INSTRUCTION_ERROR);
++			= kpatch_vmcs_read32(VM_INSTRUCTION_ERROR);
+ 		vcpu->run->fail_entry.cpu = vcpu->arch.last_vmentry_cpu;
+ 		return 0;
+ 	}
+@@ -6006,19 +6044,19 @@ static int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+ 			exit_reason != EXIT_REASON_PML_FULL &&
+ 			exit_reason != EXIT_REASON_APIC_ACCESS &&
+ 			exit_reason != EXIT_REASON_TASK_SWITCH)) {
++		int ndata = 3;
++
+ 		vcpu->run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
+ 		vcpu->run->internal.suberror = KVM_INTERNAL_ERROR_DELIVERY_EV;
+-		vcpu->run->internal.ndata = 3;
+ 		vcpu->run->internal.data[0] = vectoring_info;
+ 		vcpu->run->internal.data[1] = exit_reason;
+ 		vcpu->run->internal.data[2] = vcpu->arch.exit_qualification;
+ 		if (exit_reason == EXIT_REASON_EPT_MISCONFIG) {
+-			vcpu->run->internal.ndata++;
+-			vcpu->run->internal.data[3] =
+-				vmcs_read64(GUEST_PHYSICAL_ADDRESS);
++			vcpu->run->internal.data[ndata++] =
++				kpatch_vmcs_read64(GUEST_PHYSICAL_ADDRESS);
+ 		}
+-		vcpu->run->internal.data[vcpu->run->internal.ndata++] =
+-			vcpu->arch.last_vmentry_cpu;
++		vcpu->run->internal.data[ndata++] = vcpu->arch.last_vmentry_cpu;
++		vcpu->run->internal.ndata = ndata;
+ 		return 0;
+ 	}
+ 
+-- 
+2.26.3
+
